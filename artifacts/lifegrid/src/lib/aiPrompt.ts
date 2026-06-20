@@ -373,7 +373,7 @@ const encodeTasks = (tasks: Task[]): string => {
 // ─── Prompt types & their objective blocks ───────────────────────────────────
 export type PromptType =
   | 'compact' | 'analyze' | 'conflicts' | 'freetime' | 'balance' | 'prep' | 'digest'
-  | 'tasks-only' | 'availability' | 'projects' | 'messages' | 'patch' | 'project-reorg';
+  | 'tasks-only' | 'availability' | 'projects' | 'messages' | 'patch' | 'project-reorg' | 'cleanup-day-types';
 
 export const PROMPT_TYPES: { id: PromptType; emoji: string; title: string; description: string; badge?: string }[] = [
   { id: 'compact',      emoji: '🧭', title: 'Admin planning',        description: 'Default: share compact LifeGrid context and ask the AI admin assistant to help.', badge: 'Fast' },
@@ -381,6 +381,7 @@ export const PROMPT_TYPES: { id: PromptType; emoji: string; title: string; descr
   { id: 'tasks-only',   emoji: '✅', title: 'Task prioritization',   description: 'Sort tasks, clarify next actions, and identify urgent work.', badge: 'Focused' },
   { id: 'projects',      emoji: '🧱', title: 'Project breakdown',            description: 'Break large projects into small actionable subtasks.' },
   { id: 'project-reorg', emoji: '🏗️', title: 'Build / Reorganize Project', description: 'Create or restructure a project with tasks, milestones, schedule blocks, and review items.', badge: 'New' },
+  { id: 'cleanup-day-types', emoji: '🧹', title: 'Clean Up Grid Into Day Types', description: 'Small high-confidence first cleanup pass: preserve explicit timed events, move flexible blocks into existing day-type plans, and create tasks from actionable blocks.', badge: 'Beta' },
   { id: 'messages',      emoji: '✉️', title: 'Draft messages',               description: 'Draft emails/texts based on your schedule and tasks.' },
   { id: 'patch',        emoji: '🧩', title: 'Bulk updates / JSON',   description: 'Minimal raw JSON only: changed fields, completions, and deletes.', badge: 'Fast' },
   { id: 'analyze',      emoji: '🔍', title: 'Full schedule review',  description: 'Conflicts, overloaded days, missing prep, and general improvements.' },
@@ -452,6 +453,11 @@ List each conflict clearly, then propose "update"/"delete"/"add" fixes.`,
 2. Use reviewItems.add for uncertain requirements, assumptions, dependencies, and decisions
 3. Only update flexible-work-block, reminder, or placeholder events; protect all fixed events
 4. Put risky deletion suggestions in candidateDeletes (review-only, never auto-applied)`,
+  'cleanup-day-types': `Clean up the grid into day types:
+1. Return a small high-confidence first cleanup pass for full-calendar cleanup
+2. Preserve explicit timed events and fixed commitments
+3. Move flexible planning blocks into existing day-type plans only when safe
+4. Create tasks from actionable flexible blocks only when they do not already exist`,
 };
 
 export interface PlanningOptions {
@@ -596,6 +602,92 @@ PENDING TASKS — ${pendingTasks.length}
 ==================================================
 ${encodeTasks(pendingTasks)}
 ${schemaReference(data.categories)}`;
+  }
+
+  // ── Cleanup day-types mode ──
+  if (promptType === 'cleanup-day-types') {
+    const t = today();
+    const scoped = !!(focusStart && focusEnd);
+    const inFocus = (date: string) => scoped ? (date >= focusStart! && date <= focusEnd!) : true;
+    const rangeLabel = scoped ? `${focusStart} → ${focusEnd}` : 'the full selected LifeGrid calendar';
+    const dayTypeEvents = data.events.filter(e => inFocus(e.date) && e.eventKind === 'day-type');
+    const cleanupCandidateEvents = data.events.filter(e => inFocus(e.date) && ['flexible-work-block', 'reminder', 'placeholder'].includes(e.eventKind ?? ''));
+    const protectedEvents = data.events.filter(e => inFocus(e.date) && (!e.eventKind || !['flexible-work-block', 'reminder', 'placeholder'].includes(e.eventKind)));
+    const incompleteTasks = includeTasks ? data.tasks.filter(task => includeCompletedTasks || task.status !== 'done') : [];
+
+    return `${adminAssistantIntro(data, `cleaning up ${rangeLabel} into day types`, includeProjectsTags)}
+Today is ${t}. The exported date range is ${rangeLabel}.
+
+${OBJECTIVE['cleanup-day-types']}
+
+==================================================
+CLEANUP GOAL
+==================================================
+Clean up flexible planning clutter by proposing a small, safe LifeGrid patch that turns reusable daily planning context into day-type notes and turns truly actionable standalone blocks into tasks.
+
+For full-calendar cleanup, return a small high-confidence first patch. Prefer 5–10 transformation proposals maximum unless the user explicitly asks for a full cleanup patch.
+
+==================================================
+ABSOLUTE SAFETY RULES
+==================================================
+- Fixed-appointment, shift, travel, protected-time, day-type, and unknown/missing eventKind events must not be moved or deleted.
+- candidateDeletes are review-only and never auto-applied.
+- Use stable IDs for update/delete/transform proposals.
+- Return raw LifeGrid JSON patch only.
+- Do not output prose outside JSON.
+- When uncertain, use reviewItems.add or warnings instead of making a risky change.
+
+==================================================
+SAME-PATCH DAY-TYPE TARGET RULE
+==================================================
+Do not use mergeIntoDayType or convertTimedBlockToTask with a target day-type event that is being created in the same patch. Transform proposals may only target day-type events that already exist in the exported context. If a needed day-type event is missing, add it with events.add and add reviewItems.add explaining that a second cleanup pass is needed.
+
+==================================================
+EXISTING-TASK CONVERSION RULE
+==================================================
+Do not use convertTimedBlockToTask when the task already exists. Do not invent fields such as existingTaskIds, preserveTask, taskConversionNote, dayTypeNoteToAppend, removeSourceEvent, or mergeStrategy. If a flexible timed block already has linkedTaskIds or appears to correspond to an existing task, prefer:
+- tasks.update to link the existing task to the relevant existing day-type event, when appropriate;
+- mergeIntoDayType only if the source event’s planning context should be appended to an existing day-type event;
+- reviewItems.add if the source event should be removed but cannot be safely transformed under the current schema.
+
+==================================================
+SUPPORTED TRANSFORMATION SCHEMA — DO NOT USE ALTERNATE FIELD NAMES
+==================================================
+For events.mergeIntoDayType, use only:
+- sourceEventId
+- targetDayTypeEventId
+- mergeMode
+- noteSection
+- deleteSourceAfterMerge
+- preserveSourceInAuditTrail
+- reason
+
+For events.convertTimedBlockToTask, use only:
+- sourceEventId
+- newTask
+- deleteSourceAfterConvert
+- reason
+
+==================================================
+EXISTING DAY-TYPE EVENTS — valid transform targets only (${dayTypeEvents.length})
+==================================================
+${encodeEventsDetailed(dayTypeEvents)}
+
+==================================================
+CLEANUP CANDIDATE EVENTS — flexible-work-block, reminder, placeholder (${cleanupCandidateEvents.length})
+==================================================
+${encodeEventsDetailed(cleanupCandidateEvents)}
+
+==================================================
+PROTECTED EVENTS — context only, DO NOT MODIFY (${protectedEvents.length})
+==================================================
+${encodeEventsCompact(protectedEvents)}
+
+==================================================
+${includeTasks ? `TASKS — ${includeCompletedTasks ? 'all included' : 'incomplete only'} (${incompleteTasks.length})` : 'TASKS — not included'}
+==================================================
+${includeTasks ? encodeTasks(incompleteTasks) : '  (not included by user choice)'}
+${patchSchemaReference(data.categories)}`;
   }
 
   // ── Project build / reorganize mode ──
